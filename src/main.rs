@@ -12,6 +12,7 @@ use hyper::header::AccessControlAllowOrigin;
 use hyper::server::{Http, Request, Response, Service};
 use hyper::{Method, StatusCode};
 use log::LogLevel;
+//use std::vec::Vec;
 
 fn get_config_value(c: &sqlite::Connection, key: &'static str) -> String {
 	let mut return_value = "".to_string();
@@ -27,43 +28,27 @@ fn get_config_value(c: &sqlite::Connection, key: &'static str) -> String {
 	return_value
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct VersionResponse {
+    version: String
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Device {
+	name: String,
+	error: bool,
+	id: i32
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct DeviceResponse {
+	devices: Vec<Device>
+}
+
 fn main() {
 	simple_logger::init_with_level(LogLevel::Info).unwrap();
 
 	info!("Starting ndmsd {}...", env!("CARGO_PKG_VERSION"));
-
-	struct WebService;
-
-	impl Service for WebService {
-		// boilerplate hooking up hyper's server types
-		type Request = Request;
-		type Response = Response;
-		type Error = hyper::Error;
-		// The future representing the eventual Response your call will
-		// resolve to. This can change to whatever Future you need.
-		type Future = Box<Future<Item=Self::Response, Error=Self::Error>>;
-
-		fn call(&self, req: Request) -> Self::Future {
-			let mut response = Response::new().with_header(AccessControlAllowOrigin::Any);
-
-			 match (req.method(), req.path()) {
-				(&Method::Get, "/") => {
-					response.set_body("ndmsd is running");
-				},
-				(&Method::Get, "/version") => {
-					response.set_body("{\"version\": \"".to_owned() + env!("CARGO_PKG_VERSION") + "\"}");
-				},
-				(&Method::Post, "/echo") => {
-					response.set_body(req.body());
-				},
-				_ => {
-					response.set_status(StatusCode::NotFound);
-				},
-			};
-
-			Box::new(futures::future::ok(response))
-		}
-	}
 
 	let db = sqlite::open("./ndmsd_db.sqlite3").unwrap();
 
@@ -71,7 +56,7 @@ fn main() {
 		info!("DB: Table 'devices' exists");
 	} else {
 		warn!("DB: Table 'devices' does not exist. Creating.");
-		db.execute("CREATE TABLE devices (name TEXT, services TEXT);").unwrap();
+		db.execute("CREATE TABLE devices (name TEXT, error BOOL);").unwrap();
 	}
 
 	if db.execute("SELECT * FROM config").is_ok() {
@@ -103,6 +88,65 @@ fn main() {
 		Ok(v) => println!("DB: web_port: {:?}", v.Value),
 		Err(e) => println!("DB: Error getting web_port")
 	}*/
+
+	struct WebService;
+
+	impl Service for WebService {
+		// boilerplate hooking up hyper's server types
+		type Request = Request;
+		type Response = Response;
+		type Error = hyper::Error;
+		// The future representing the eventual Response your call will
+		// resolve to. This can change to whatever Future you need.
+		type Future = Box<Future<Item=Self::Response, Error=Self::Error>>;
+
+		fn call(&self, req: Request) -> Self::Future {
+			let mut response = Response::new().with_header(AccessControlAllowOrigin::Any);
+
+			 match (req.method(), req.path()) {
+				(&Method::Get, "/") => {
+					response.set_body("ndmsd is running");
+				},
+				/*(&Method::Get, "/version") => {
+					response.set_body("{\"version\": \"".to_owned() + env!("CARGO_PKG_VERSION") + "\"}");
+				},*/
+				(&Method::Get, "/version") => {
+					let response_object = VersionResponse { 
+						version: env!("CARGO_PKG_VERSION").to_string() 
+					};
+					let serialized = serde_json::to_string(&response_object).unwrap();
+					response.set_body(serialized);
+				},
+				(&Method::Get, "/devices") => {
+					let mut vec = Vec::new();
+					vec.push(Device {name:"Device 1".to_string(),error:false,id:1});
+					vec.push(Device {name:"Device 2".to_string(),error:true,id:2});
+
+					/*db.iterate("SELECT * FROM devices", |devices| {
+						for &(column, value) in devices.iter() {
+							println!("{} = {}", column, value.unwrap());
+						}
+						true
+					})
+					.unwrap();*/
+
+					let response_object = DeviceResponse { 
+						devices: vec
+					};
+					let serialized = serde_json::to_string(&response_object).unwrap();
+					response.set_body(serialized);
+				},
+				(&Method::Post, "/echo") => {
+					response.set_body(req.body());
+				},
+				_ => {
+					response.set_status(StatusCode::NotFound);
+				},
+			};
+
+			Box::new(futures::future::ok(response))
+		}
+	}
 
 	let web_bind_address = get_config_value(&db, "web_host") + ":" + &get_config_value(&db, "web_port");
 
