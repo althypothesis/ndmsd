@@ -1,157 +1,154 @@
+#![feature(plugin, custom_derive)]
+#![plugin(rocket_codegen)]
+
 #[macro_use] extern crate log;
 extern crate simple_logger;
-extern crate hyper;
-extern crate futures;
+extern crate rocket;
+extern crate rocket_cors;
 extern crate sqlite;
-#[macro_use] extern crate serde_derive;
-extern crate serde;
-extern crate serde_json;
 
-use futures::future::Future;
-use hyper::header::AccessControlAllowOrigin;
-use hyper::server::{Http, Request, Response, Service};
-use hyper::{Method, StatusCode};
+use std::sync::Mutex;
+use rocket::{Rocket, State};
+use rocket::http::Method;
+use rocket_cors::{AllowedOrigins, AllowedHeaders};
+use sqlite::{Connection, Error};
 use log::LogLevel;
-//use std::vec::Vec;
+use rocket::config::{Config, Environment};
 
-fn get_config_value(c: &sqlite::Connection, key: &'static str) -> String {
-	let mut return_value = "".to_string();
-	let sql_statement = "SELECT value FROM config WHERE key = '".to_owned() + key + "'"; // maybe add LIMIT 1
-	c.iterate(sql_statement, |values| {
-		for &(column, value) in values.iter() {
-			return_value = value.unwrap().to_string();
-			debug!("get_config_value(): {} = {}", column, return_value);
-			break;
-		}
-		true
-	}).unwrap();
-	return_value
+
+type DbConn = Mutex<Connection>;
+
+struct WebserverConfig {
+    host: String,
+    port: u16
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct VersionResponse {
-    version: String
+fn init_database(db_conn: &Connection, webserver_config: &mut WebserverConfig) {
+    if db_conn.execute("SELECT * FROM devices").is_ok() {
+        info!("DB: Table 'devices' exists");
+    } else {
+        warn!("DB: Table 'devices' does not exist. Creating with defautl values.");
+        db_conn.execute("CREATE TABLE devices (name TEXT, error BOOL);").unwrap();
+    }
+
+    if db_conn.execute("SELECT * FROM config").is_ok() {
+        info!("DB: Table 'config' exists");
+    } else {
+        warn!("DB: Table 'config' does not exist. Creating.");
+        db_conn.execute("
+            CREATE TABLE config (key TEXT, value TEXT);
+            INSERT INTO config (key, value) VALUES ('web_port','12526');
+            INSERT INTO config (key, value) VALUES ('web_host','0.0.0.0');
+        ").unwrap();
+    }
+
+    // Get config for webserver (this needs to be done early, so we do it here)
+    db_conn.iterate("SELECT value FROM config WHERE key = 'web_host'", |values| {
+        for &(_column, value) in values.iter() {
+            webserver_config.host = value.unwrap().to_string();
+            debug!("init_databse(): webserver_config.host is: {}", webserver_config.host);
+            break;
+        }
+        true
+    }).unwrap();
+    db_conn.iterate("SELECT value FROM config WHERE key = 'web_port'", |values| {
+        for &(_column, value) in values.iter() {
+            webserver_config.port = value.unwrap().parse::<u16>().unwrap();
+            debug!("init_databse(): webserver_config.port is: {}", webserver_config.port);
+            break;
+        }
+        true
+    }).unwrap();
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct Device {
-	name: String,
-	error: bool,
-	id: i32
+fn get_config_value(db_conn: State<DbConn>, key: &'static str) -> String {
+    let mut return_value = "".to_string();
+    let sql_statement = "SELECT value FROM config WHERE key = '".to_owned() + key + "'"; // maybe add LIMIT 1
+    db_conn.lock()
+        .expect("db connection lock")
+        .iterate(sql_statement, |values| {
+            for &(column, value) in values.iter() {
+                return_value = value.unwrap().to_string();
+                debug!("get_config_value(): {} = {}", column, return_value);
+                break;
+            }
+            true
+        }).unwrap();
+    return_value
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct DeviceResponse {
-	devices: Vec<Device>
+#[get("/")]
+fn rocket_index(_db_conn: State<DbConn>) -> &'static str  {
+    "ndmsd is running"
+}
+
+#[get("/version")]
+fn rocket_version(_db_conn: State<DbConn>) -> &'static str  {
+    concat!("{ \"version\": \"",
+        env!("CARGO_PKG_VERSION"),
+        "\" }")
+}
+
+#[get("/devices")]
+fn rocket_devices(db_conn: State<DbConn>) -> &'static str  {
+    r#"{
+        "devices": [{
+            "name": "Hardcoded Device One",
+            "error": 0,
+            "id": 12
+        }, {
+            "name": "Hardcoded Device Two",
+            "error": 1,
+            "id": "eggs"
+        }, {
+            "name": "Hardcoded Device Three",
+            "error": 0,
+            "id": "474caade-1cd1-4450-9dd5-1962c37e5206"
+        }]
+    }"#
+}
+
+fn rocket() -> Rocket {
+    simple_logger::init_with_level(LogLevel::Info).unwrap();
+    info!("Starting ndmsd {}", env!("CARGO_PKG_VERSION"));
+
+    // Open sqlite database
+    info!("Opening databse");
+    let conn = sqlite::open("./ndmsd_db.sqlite3").unwrap();
+
+    // Initialize the database and get config values
+    let mut webserver_config = WebserverConfig {
+        host: "".to_string(),
+        port: 0
+    };
+    init_database(&conn, &mut webserver_config);
+
+    // Have Rocket manage the database pool.
+    info!("Starting webserver");
+    let config = Config::build(Environment::Staging)
+        .address(webserver_config.host)
+        .port(webserver_config.port)
+        .workers(4)
+        .unwrap();
+
+    // CORS
+    //let (allowed_origins, failed_origins) = AllowedOrigins::all();
+    //assert!(failed_origins.is_empty());
+    let options = rocket_cors::Cors { // You can also deserialize this
+        allowed_origins: AllowedOrigins::all(),
+        allowed_methods: vec![Method::Get].into_iter().map(From::from).collect(),
+        allowed_headers: AllowedHeaders::some(&["Authorization", "Accept"]),
+        allow_credentials: true,
+        ..Default::default()
+    };
+
+    //rocket::ignite()
+    rocket::custom(config, false)
+        .manage(Mutex::new(conn))
+        .attach(options)
+        .mount("/", routes![rocket_index, rocket_version, rocket_devices])
 }
 
 fn main() {
-	simple_logger::init_with_level(LogLevel::Info).unwrap();
-
-	info!("Starting ndmsd {}...", env!("CARGO_PKG_VERSION"));
-
-	let db = sqlite::open("./ndmsd_db.sqlite3").unwrap();
-
-	if db.execute("SELECT * FROM devices").is_ok() {
-		info!("DB: Table 'devices' exists");
-	} else {
-		warn!("DB: Table 'devices' does not exist. Creating.");
-		db.execute("CREATE TABLE devices (name TEXT, error BOOL);").unwrap();
-	}
-
-	if db.execute("SELECT * FROM config").is_ok() {
-		info!("DB: Table 'config' exists");
-	} else {
-		warn!("DB: Table 'config' does not exist. Creating.");
-		db.execute("
-			CREATE TABLE config (key TEXT, value TEXT);
-			INSERT INTO config (key, value) VALUES ('web_port','12526');
-			INSERT INTO config (key, value) VALUES ('web_host','127.0.0.1');
-		").unwrap();
-	}
-
-	/*db.iterate("SELECT * FROM devices WHERE age > 40", |pairs| {
-		for &(column, value) in pairs.iter() {
-			println!("{} = {}", column, value.unwrap());
-		}
-		true
-	})
-	.unwrap();*/
-	/*
-	let web_port = db.iterate("SELECT * FROM config WHERE key = 'web_port'", |port| {
-		for &(column, value) in pairs.iter() {
-			println!("{} = {}", column, value.unwrap());
-		}
-		true
-	});*/
-	/*match web_port {
-		Ok(v) => println!("DB: web_port: {:?}", v.Value),
-		Err(e) => println!("DB: Error getting web_port")
-	}*/
-
-	struct WebService;
-
-	impl Service for WebService {
-		// boilerplate hooking up hyper's server types
-		type Request = Request;
-		type Response = Response;
-		type Error = hyper::Error;
-		// The future representing the eventual Response your call will
-		// resolve to. This can change to whatever Future you need.
-		type Future = Box<Future<Item=Self::Response, Error=Self::Error>>;
-
-		fn call(&self, req: Request) -> Self::Future {
-			let mut response = Response::new().with_header(AccessControlAllowOrigin::Any);
-
-			 match (req.method(), req.path()) {
-				(&Method::Get, "/") => {
-					response.set_body("ndmsd is running");
-				},
-				/*(&Method::Get, "/version") => {
-					response.set_body("{\"version\": \"".to_owned() + env!("CARGO_PKG_VERSION") + "\"}");
-				},*/
-				(&Method::Get, "/version") => {
-					let response_object = VersionResponse { 
-						version: env!("CARGO_PKG_VERSION").to_string() 
-					};
-					let serialized = serde_json::to_string(&response_object).unwrap();
-					response.set_body(serialized);
-				},
-				(&Method::Get, "/devices") => {
-					let mut vec = Vec::new();
-					vec.push(Device {name:"Device 1".to_string(),error:false,id:1});
-					vec.push(Device {name:"Device 2".to_string(),error:true,id:2});
-
-					/*db.iterate("SELECT * FROM devices", |devices| {
-						for &(column, value) in devices.iter() {
-							println!("{} = {}", column, value.unwrap());
-						}
-						true
-					})
-					.unwrap();*/
-
-					let response_object = DeviceResponse { 
-						devices: vec
-					};
-					let serialized = serde_json::to_string(&response_object).unwrap();
-					response.set_body(serialized);
-				},
-				(&Method::Post, "/echo") => {
-					response.set_body(req.body());
-				},
-				_ => {
-					response.set_status(StatusCode::NotFound);
-				},
-			};
-
-			Box::new(futures::future::ok(response))
-		}
-	}
-
-	let web_bind_address = get_config_value(&db, "web_host") + ":" + &get_config_value(&db, "web_port");
-
-	info!("Starting webserver on {}...", web_bind_address);
-
-	let server = Http::new().bind(&web_bind_address.parse().unwrap(), || Ok(WebService)).unwrap();
-	server.run().unwrap();
+    rocket().launch();
 }
