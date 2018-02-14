@@ -273,7 +273,14 @@ fn rocket() -> Rocket {
 }
 
 fn main() {
-	thread::spawn(|| { // spin off webserver thread
+	let webserver_thread = thread::spawn(|| { // spin off webserver thread
 		rocket().launch();
 	});
+
+	let webserver_thread_result = webserver_thread.join();
+	
+	match webserver_thread_result {
+		Ok(k) => debug!("Webserver exited successfully: {:?}", k),
+		Err(r) => warn!("Webserver thread did not exit cleanly: {:?}", r)
+	}
 }
