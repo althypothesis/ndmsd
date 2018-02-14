@@ -18,6 +18,7 @@ use sqlite::{Connection};
 use log::LogLevel;
 use rocket::config::{Config, Environment};
 use rocket::response::status::NotFound;
+use std::thread;
 
 
 type DbConn = Mutex<Connection>;
@@ -272,5 +273,7 @@ fn rocket() -> Rocket {
 }
 
 fn main() {
-	rocket().launch();
+	thread::spawn(|| { // spin off webserver thread
+		rocket().launch();
+	});
 }
